@@ -1,9 +1,10 @@
 """
-Codeforces Scraper – scrapes ALL problems with statements, editorials, and solutions.
+Codeforces Scraper – parallel scraping of ALL problems with statements,
+editorials, and solutions.
 
 Usage:
-    # Scrape everything (auto-resumes from checkpoint):
-    python codeforces.py --all
+    # Scrape everything with 8 parallel workers:
+    python codeforces.py --all --workers 8
 
     # Scrape with filters:
     python codeforces.py --all --min-rating 800 --max-rating 1600
@@ -12,7 +13,7 @@ Usage:
     python codeforces.py CF-1560A CF-4B
 
     # Light mode (no editorial/solutions, much faster):
-    python codeforces.py --all --light
+    python codeforces.py --all --light --workers 12
 
     # Test with a small batch:
     python codeforces.py --all --max 10
@@ -23,10 +24,13 @@ Output is written to data/codeforces_problems.jsonl (one JSON object per line).
 import json
 import os
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import time
 import re
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from pathlib import Path
 
@@ -34,53 +38,103 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://codeforces.com"
 API_URL = f"{BASE_URL}/api"
-REQUEST_DELAY = 1.0          # be polite – 1 req/sec
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2.0          # exponential backoff factor
+RETRY_BACKOFF = 2.0
+
+# Defaults
+DEFAULT_WORKERS = 4
+DEFAULT_RPS = 4.0            # requests per second (global across all workers)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_OUTPUT = DATA_DIR / "codeforces_problems.jsonl"
 DEFAULT_CHECKPOINT = DATA_DIR / "codeforces_checkpoint.txt"
 
 
+# ======================================================================
+# Token-bucket rate limiter (thread-safe)
+# ======================================================================
+class RateLimiter:
+    """
+    Token-bucket rate limiter shared across all threads.
+    Ensures we never exceed `rate` requests per second globally.
+    """
+
+    def __init__(self, rate: float):
+        self.rate = rate                    # tokens per second
+        self.capacity = max(rate, 1.0)      # burst capacity
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        """Block until a token is available."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.last
+                self.tokens = min(self.capacity,
+                                  self.tokens + elapsed * self.rate)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+            # Not enough tokens – sleep a short interval and retry
+            time.sleep(1.0 / self.rate)
+
+
+# ======================================================================
+# Scraper
+# ======================================================================
 class CodeforcesScraper:
-    def __init__(self, delay: float = REQUEST_DELAY,
+    def __init__(self, rps: float = DEFAULT_RPS,
                  cookies: Optional[dict] = None):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            )
-        })
+        self.session = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
         if cookies:
             self.session.cookies.update(cookies)
-        self.delay = delay
-        # Cache: contest_id -> editorial_url
+
+        # Shared rate limiter
+        self.limiter = RateLimiter(rps)
+
+        # Thread-safe caches
         self._editorial_url_cache: dict[str, Optional[str]] = {}
-        # Cache: API problems for rating lookup
+        self._editorial_cache_lock = threading.Lock()
+        self._editorial_fetch_locks: dict[str, threading.Lock] = {}
+        self._editorial_fetch_locks_lock = threading.Lock()
+
         self._api_ratings: dict[str, Optional[int]] = {}
+
+        # File I/O lock
+        self._file_lock = threading.Lock()
+
+        # Progress counter
+        self._progress_lock = threading.Lock()
+        self._done_count = 0
+        self._error_count = 0
 
     def set_cookies(self, cookies: dict):
         self.session.cookies.update(cookies)
 
     # ------------------------------------------------------------------
-    # HTTP helpers with retry
+    # HTTP helpers with retry + rate limiting
     # ------------------------------------------------------------------
-    def _wait(self):
-        time.sleep(self.delay)
-
     def _get(self, url: str, retries: int = MAX_RETRIES) -> requests.Response:
-        self._wait()
+        self.limiter.acquire()
         for attempt in range(retries):
             try:
                 logger.debug("GET %s (attempt %d)", url, attempt + 1)
                 resp = self.session.get(url, timeout=30)
                 if resp.status_code == 429:
                     wait = RETRY_BACKOFF ** (attempt + 1)
-                    logger.warning("Rate limited, waiting %.1fs ...", wait)
+                    logger.warning("Rate limited on %s, waiting %.1fs ...",
+                                   url, wait)
                     time.sleep(wait)
+                    self.limiter.acquire()
                     continue
                 resp.raise_for_status()
                 return resp
@@ -88,16 +142,16 @@ class CodeforcesScraper:
                 if attempt == retries - 1:
                     raise
                 wait = RETRY_BACKOFF ** (attempt + 1)
-                logger.warning(
-                    "Request failed (%s), retry in %.1fs ...", exc, wait
-                )
+                logger.warning("Request failed (%s), retry in %.1fs ...",
+                               exc, wait)
                 time.sleep(wait)
-        raise RuntimeError(f"Exhausted retries for {url}")   # unreachable
+                self.limiter.acquire()
+        raise RuntimeError(f"Exhausted retries for {url}")
 
     def _api_get(self, endpoint: str, params: dict | None = None) -> dict:
-        """Call the Codeforces API (with retry)."""
+        """Call the Codeforces API (with retry + rate limit)."""
         url = f"{API_URL}/{endpoint}"
-        self._wait()
+        self.limiter.acquire()
         for attempt in range(MAX_RETRIES):
             try:
                 resp = self.session.get(url, params=params, timeout=60)
@@ -105,6 +159,7 @@ class CodeforcesScraper:
                     wait = RETRY_BACKOFF ** (attempt + 1)
                     logger.warning("API rate limited, waiting %.1fs ...", wait)
                     time.sleep(wait)
+                    self.limiter.acquire()
                     continue
                 resp.raise_for_status()
                 data = resp.json()
@@ -118,6 +173,7 @@ class CodeforcesScraper:
                 logger.warning("API request failed (%s), retry in %.1fs ...",
                                exc, wait)
                 time.sleep(wait)
+                self.limiter.acquire()
         raise RuntimeError(f"Exhausted retries for {url}")
 
     # ------------------------------------------------------------------
@@ -150,9 +206,7 @@ class CodeforcesScraper:
         logger.info("Fetching problem list from Codeforces API ...")
         result = self._api_get("problemset.problems")
         problems = result["problems"]
-        stats = result.get("problemStatistics", [])
 
-        # Build rating cache
         for p in problems:
             cid = p.get("contestId")
             idx = p.get("index")
@@ -179,13 +233,11 @@ class CodeforcesScraper:
         div = soup.find("div", class_="time-limit")
         if div:
             text = div.get_text(" ", strip=True)
-            # Remove the label prefix like "time limit per test"
             text = re.sub(r'^time limit per test\s*', '', text, flags=re.I)
             return text.strip() or div.get_text(" ", strip=True)
         return ""
 
     def _extract_difficulty(self, soup: BeautifulSoup) -> Optional[int]:
-        """Fallback: try to get difficulty from the problem page tags."""
         for tag in soup.find_all("span", class_="tag-box"):
             title = tag.get("title", "")
             if "difficulty" in title.lower():
@@ -196,44 +248,63 @@ class CodeforcesScraper:
         return None
 
     # ------------------------------------------------------------------
-    # Editorial: discover URL from the contest page
+    # Editorial: discover URL from the contest page (thread-safe)
     # ------------------------------------------------------------------
-    def _find_editorial_url(self, contest_id: str) -> Optional[str]:
-        """Find the editorial blog entry URL for a contest."""
-        if contest_id in self._editorial_url_cache:
-            return self._editorial_url_cache[contest_id]
+    def _get_editorial_fetch_lock(self, contest_id: str) -> threading.Lock:
+        """Get a per-contest lock so only one thread fetches the editorial URL."""
+        with self._editorial_fetch_locks_lock:
+            if contest_id not in self._editorial_fetch_locks:
+                self._editorial_fetch_locks[contest_id] = threading.Lock()
+            return self._editorial_fetch_locks[contest_id]
 
-        # Strategy 1: Check the contest page sidebar
+    def _find_editorial_url(self, contest_id: str) -> Optional[str]:
+        """Find the editorial blog entry URL for a contest (thread-safe)."""
+        # Fast path: check cache without lock
+        with self._editorial_cache_lock:
+            if contest_id in self._editorial_url_cache:
+                return self._editorial_url_cache[contest_id]
+
+        # Slow path: only one thread per contest does the actual fetch
+        fetch_lock = self._get_editorial_fetch_lock(contest_id)
+        with fetch_lock:
+            # Double-check after acquiring lock
+            with self._editorial_cache_lock:
+                if contest_id in self._editorial_url_cache:
+                    return self._editorial_url_cache[contest_id]
+
+            # Actually fetch
+            editorial_url = self._fetch_editorial_url(contest_id)
+            with self._editorial_cache_lock:
+                self._editorial_url_cache[contest_id] = editorial_url
+            return editorial_url
+
+    def _fetch_editorial_url(self, contest_id: str) -> Optional[str]:
+        """Fetch the editorial URL from the contest page."""
         contest_url = f"{BASE_URL}/contest/{contest_id}"
         try:
             resp = self._get(contest_url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Look for "Tutorial" / "Editorial" links in the sidebar
             for a in soup.find_all("a", href=True):
                 txt = a.get_text(strip=True).lower()
                 href = a["href"]
                 if re.search(r'\btutorial\b|\beditorial\b', txt):
                     if href.startswith("/"):
                         href = BASE_URL + href
-                    self._editorial_url_cache[contest_id] = href
                     logger.debug("Editorial for contest %s: %s",
                                  contest_id, href)
                     return href
 
-            # Look for any blog/entry links on the contest page
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if "/blog/entry/" in href:
                     txt = a.get_text(strip=True).lower()
                     if re.search(r'tutorial|editorial|разбор', txt):
                         full = href if href.startswith("http") else BASE_URL + href
-                        self._editorial_url_cache[contest_id] = full
                         return full
         except requests.RequestException:
             logger.warning("Failed to fetch contest page %s", contest_url)
 
-        self._editorial_url_cache[contest_id] = None
         return None
 
     # ------------------------------------------------------------------
@@ -241,7 +312,6 @@ class CodeforcesScraper:
     # ------------------------------------------------------------------
     def _scrape_editorial_text(self, editorial_url: str,
                                contest_id: str, index: str) -> str:
-        """Scrape the editorial blog and extract text for a specific problem."""
         try:
             resp = self._get(editorial_url)
         except requests.RequestException:
@@ -250,16 +320,15 @@ class CodeforcesScraper:
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # The problem identifier in editorials (e.g. "1560A", "A", "Problem A")
         problem_patterns = [
-            f"{contest_id}{index}",           # "1560A"
-            f"{contest_id} {index}",          # "1560 A"
-            f"Problem {index}",               # "Problem A"
-            f"{index}.",                       # "A."
-            f"{index} ",                       # "A " at start
+            f"{contest_id}{index}",
+            f"{contest_id} {index}",
+            f"Problem {index}",
+            f"{index}.",
+            f"{index} ",
         ]
 
-        # Strategy 1: Look for tutorial-content divs (Codeforces blog spoiler format)
+        # Strategy 1: spoiler divs
         for spoiler in soup.find_all("div", class_="spoiler"):
             title_el = spoiler.find(class_="spoiler-title")
             if title_el:
@@ -270,7 +339,7 @@ class CodeforcesScraper:
                         if content:
                             return content.get_text("\n", strip=True)
 
-        # Strategy 2: Look for headers matching the problem
+        # Strategy 2: headers
         for header in soup.find_all(re.compile(r'^h[1-6]$')):
             header_text = header.get_text(strip=True)
             for pattern in problem_patterns:
@@ -283,7 +352,7 @@ class CodeforcesScraper:
                     if parts:
                         return "\n".join(parts)
 
-        # Strategy 3: Bold text section headers
+        # Strategy 3: bold text section headers
         for b_tag in soup.find_all("b"):
             b_text = b_tag.get_text(strip=True)
             for pattern in problem_patterns:
@@ -293,46 +362,40 @@ class CodeforcesScraper:
                     if parent:
                         for sib in parent.find_next_siblings():
                             if sib.find("b"):
-                                # Check if this bold starts a new problem section
                                 next_b = sib.find("b")
                                 if next_b and re.search(
-                                        r'[A-Z]\d*[.\s]', next_b.get_text(strip=True)):
+                                        r'[A-Z]\d*[.\s]',
+                                        next_b.get_text(strip=True)):
                                     break
                             parts.append(sib.get_text("\n", strip=True))
                     if parts:
                         return "\n".join(parts)
 
-        # Strategy 4: tutorial-content div (older format)
+        # Strategy 4: tutorial-content div
         tutorial = soup.find("div", class_="tutorial-content")
         if tutorial is not None:
             return tutorial.get_text("\n", strip=True)
 
-        # Strategy 5: fallback – grab the whole blog content
+        # Strategy 5: fallback
         content = soup.find("div", class_="content")
         if content:
             text = content.get_text("\n", strip=True)
-            # Try to find the relevant section
             for pattern in problem_patterns:
                 idx_pos = text.lower().find(pattern.lower())
                 if idx_pos >= 0:
-                    # Extract ~3000 chars from this point
                     return text[idx_pos:idx_pos + 3000]
             return text[:3000]
 
         return ""
 
     # ------------------------------------------------------------------
-    # Accepted solutions – fetch from status page + submission source
+    # Accepted solutions
     # ------------------------------------------------------------------
     def _scrape_accepted_solutions(self, contest_id: str, index: str,
                                    max_solutions: int = 2) -> list[str]:
-        """Get source code of accepted solutions for a problem."""
-        # Try the API first (more reliable than scraping the status page)
         submission_ids = self._get_accepted_submission_ids_api(
             contest_id, index, max_solutions
         )
-
-        # Fallback to scraping the status page
         if not submission_ids:
             submission_ids = self._get_accepted_submission_ids_scrape(
                 contest_id, index, max_solutions
@@ -348,15 +411,15 @@ class CodeforcesScraper:
 
     def _get_accepted_submission_ids_api(self, contest_id: str, index: str,
                                          max_solutions: int) -> list[str]:
-        """Use contest.status API to find accepted submission IDs."""
         try:
             result = self._api_get("contest.status", params={
                 "contestId": contest_id,
                 "from": 1,
-                "count": 50,  # check first 50 submissions
+                "count": 50,
             })
         except Exception:
-            logger.debug("API contest.status failed for contest %s", contest_id)
+            logger.debug("API contest.status failed for contest %s",
+                         contest_id)
             return []
 
         ids = []
@@ -367,8 +430,9 @@ class CodeforcesScraper:
                 continue
             if sub.get("verdict") != "OK":
                 continue
-            # One solution per author to get diverse solutions
-            author = sub.get("author", {}).get("members", [{}])[0].get("handle", "")
+            author = (sub.get("author", {})
+                      .get("members", [{}])[0]
+                      .get("handle", ""))
             if author in seen_authors:
                 continue
             seen_authors.add(author)
@@ -379,7 +443,6 @@ class CodeforcesScraper:
 
     def _get_accepted_submission_ids_scrape(self, contest_id: str, index: str,
                                             max_solutions: int) -> list[str]:
-        """Scrape the status page to find accepted submission IDs."""
         status_url = (
             f"{BASE_URL}/problemset/status/{contest_id}/problem/{index}"
         )
@@ -413,20 +476,18 @@ class CodeforcesScraper:
 
     def _fetch_submission_code(self, contest_id: str,
                                submission_id: str) -> Optional[str]:
-        """Download the source code for a specific submission."""
-        # Try the contest URL format first
         sub_url = f"{BASE_URL}/contest/{contest_id}/submission/{submission_id}"
-        self._wait()
+        self.limiter.acquire()
         try:
             resp = self.session.get(sub_url, timeout=30, allow_redirects=True)
         except requests.RequestException:
             return None
 
         if resp.status_code != 200:
-            # Try the problemset URL format
             sub_url = f"{BASE_URL}/problemset/submission/{contest_id}/{submission_id}"
             try:
-                resp = self.session.get(sub_url, timeout=30, allow_redirects=True)
+                resp = self.session.get(sub_url, timeout=30,
+                                        allow_redirects=True)
             except requests.RequestException:
                 return None
 
@@ -437,7 +498,6 @@ class CodeforcesScraper:
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Try multiple selectors for the source code
         pre = soup.find("pre", id="program-source-text")
         if pre is not None:
             return pre.get_text("\n", strip=True)
@@ -445,7 +505,6 @@ class CodeforcesScraper:
         for pre in soup.find_all("pre", class_="program-source"):
             return pre.get_text("\n", strip=True)
 
-        # Some pages have it in a different div
         source_div = soup.find("div", id="program-source-text")
         if source_div:
             return source_div.get_text("\n", strip=True)
@@ -459,7 +518,6 @@ class CodeforcesScraper:
                        api_rating: Optional[int] = None,
                        skip_editorial: bool = False,
                        skip_solutions: bool = False) -> dict:
-        """Scrape a single problem: statement, editorial, solutions."""
         contest_id, index = self.parse_problem_id(problem_id)
         url = self.problem_url(contest_id, index)
 
@@ -469,12 +527,10 @@ class CodeforcesScraper:
         problem_statement = self._extract_problem_statement(soup)
         time_limit = self._extract_time_limit(soup)
 
-        # Use API rating if available, fallback to page scrape
         difficulty = api_rating or self._get_api_rating(problem_id)
         if difficulty is None:
             difficulty = self._extract_difficulty(soup)
 
-        # Editorial
         editorial_text = ""
         if not skip_editorial:
             editorial_url = self._find_editorial_url(contest_id)
@@ -483,7 +539,6 @@ class CodeforcesScraper:
                     editorial_url, contest_id, index
                 )
 
-        # Accepted solutions
         accepted_solutions = []
         if not skip_solutions:
             accepted_solutions = self._scrape_accepted_solutions(
@@ -502,7 +557,7 @@ class CodeforcesScraper:
         }
 
     # ------------------------------------------------------------------
-    # Batch scrape (list of IDs)
+    # Batch scrape (list of IDs) – sequential
     # ------------------------------------------------------------------
     def scrape_problems(self, problem_ids: list[str],
                         output_file: Optional[str] = None) -> list[dict]:
@@ -520,14 +575,13 @@ class CodeforcesScraper:
                     "source": "Codeforces",
                     "error": str(exc),
                 })
-            # Save incrementally
             if output_file is not None:
                 with open(output_file, "w") as f:
                     json.dump(results, f, indent=2, default=str)
         return results
 
     # ------------------------------------------------------------------
-    # Scrape ALL problems with checkpoint/resume
+    # Scrape ALL problems – PARALLEL with checkpoint/resume
     # ------------------------------------------------------------------
     @staticmethod
     def _parse_rating(rating) -> Optional[int]:
@@ -537,27 +591,75 @@ class CodeforcesScraper:
             return int(rating)
         return None
 
+    def _scrape_one(self, pid: str, api_rating: Optional[int],
+                    total: int,
+                    output_file: str, checkpoint_file: str,
+                    skip_editorial: bool, skip_solutions: bool) -> bool:
+        """
+        Scrape a single problem and write results (called from worker thread).
+        Returns True on success, False on failure.
+        """
+        try:
+            data = self.scrape_problem(
+                pid,
+                api_rating=api_rating,
+                skip_editorial=skip_editorial,
+                skip_solutions=skip_solutions,
+            )
+            ok = True
+        except Exception as exc:
+            logger.error("  ✗ %s failed: %s", pid, exc)
+            data = {"id": pid, "source": "Codeforces", "error": str(exc)}
+            ok = False
+
+        # Thread-safe file write
+        with self._file_lock:
+            with open(output_file, "a") as f:
+                f.write(json.dumps(data, default=str) + "\n")
+            with open(checkpoint_file, "a") as f:
+                f.write(pid + "\n")
+
+        # Progress
+        with self._progress_lock:
+            if ok:
+                self._done_count += 1
+            else:
+                self._error_count += 1
+            done = self._done_count
+            errs = self._error_count
+
+        stmt_len = len(data.get("problem_statement", ""))
+        edit_len = len(data.get("editorial_text", ""))
+        sol_cnt = len(data.get("accepted_solutions", []))
+
+        if ok:
+            logger.info(
+                "  ✓ [%d/%d] %s  (stmt=%d  edit=%d  sols=%d)  errors=%d",
+                done + errs, total, pid, stmt_len, edit_len, sol_cnt, errs,
+            )
+        return ok
+
     def scrape_all(self, output_file: str, checkpoint_file: str,
+                   workers: int = DEFAULT_WORKERS,
                    max_problems: Optional[int] = None,
                    skip_editorial: bool = False,
                    skip_solutions: bool = False,
                    min_rating: Optional[int] = None,
                    max_rating: Optional[int] = None):
         """
-        Scrape all Codeforces problems. Automatically resumes from checkpoint.
-
-        Output is JSONL (one JSON object per line) for streaming writes.
+        Scrape all Codeforces problems in parallel.
+        Automatically resumes from checkpoint.
         """
         problems = self.fetch_problem_list()
 
-        # Load checkpoint (already-scraped problem IDs)
+        # Load checkpoint
         seen = set()
         if os.path.exists(checkpoint_file):
             with open(checkpoint_file) as f:
                 seen = set(line.strip() for line in f if line.strip())
             logger.info("Checkpoint: %d problems already scraped", len(seen))
 
-        # Filter & sort
+        # Filter
         filtered = []
         for p in problems:
             cid = p.get("contestId")
@@ -570,71 +672,81 @@ class CodeforcesScraper:
                 continue
 
             rating = self._parse_rating(p.get("rating"))
-            if min_rating is not None and (rating is None or rating < min_rating):
+            if min_rating is not None and (rating is None
+                                           or rating < min_rating):
                 continue
-            if max_rating is not None and (rating is not None and rating > max_rating):
+            if max_rating is not None and (rating is not None
+                                           and rating > max_rating):
                 continue
 
-            filtered.append((pid, rating))
+            filtered.append((pid, rating, str(cid)))
 
         if max_problems is not None:
             filtered = filtered[:max_problems]
 
         total = len(filtered)
-        logger.info("Problems to scrape: %d (skipping %d already done)",
-                     total, len(seen))
+        logger.info(
+            "Problems to scrape: %d  (skipping %d already done)  "
+            "workers=%d  rps=%.1f",
+            total, len(seen), workers, self.limiter.rate,
+        )
 
         if not filtered:
             logger.info("Nothing to scrape – all done!")
             return
 
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
 
-        success = 0
-        errors = 0
-        for i, (pid, api_rating) in enumerate(filtered):
-            logger.info("[%d/%d] %s (rating=%s)", i + 1, total, pid,
-                        api_rating or "?")
-            try:
-                data = self.scrape_problem(
-                    pid,
-                    api_rating=api_rating,
-                    skip_editorial=skip_editorial,
-                    skip_solutions=skip_solutions,
+        # Sort by contest ID so threads working on the same contest
+        # share the editorial URL cache efficiently
+        filtered.sort(key=lambda x: x[2])
+
+        # Reset counters
+        self._done_count = 0
+        self._error_count = 0
+
+        t0 = time.monotonic()
+
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="cf-worker") as pool:
+            futures = {}
+            for pid, api_rating, _cid in filtered:
+                fut = pool.submit(
+                    self._scrape_one,
+                    pid, api_rating, total,
+                    output_file, checkpoint_file,
+                    skip_editorial, skip_solutions,
                 )
-                success += 1
-                logger.info("  ✓ done (%d chars statement, %d chars editorial, "
-                            "%d solutions)",
-                            len(data.get("problem_statement", "")),
-                            len(data.get("editorial_text", "")),
-                            len(data.get("accepted_solutions", [])))
-            except Exception as exc:
-                logger.error("  ✗ failed: %s", exc)
-                data = {"id": pid, "source": "Codeforces", "error": str(exc)}
-                errors += 1
+                futures[fut] = pid
 
-            # Append to JSONL (one line per problem – safe for streaming)
-            with open(output_file, "a") as f:
-                f.write(json.dumps(data, default=str) + "\n")
-            # Mark as done in checkpoint
-            with open(checkpoint_file, "a") as f:
-                f.write(pid + "\n")
+            # Wait for all futures and log any unexpected exceptions
+            for fut in as_completed(futures):
+                pid = futures[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    logger.error("Unexpected error in worker for %s: %s",
+                                 pid, exc)
 
+        elapsed = time.monotonic() - t0
         logger.info(
-            "="*60 + "\n"
-            "Scraping complete: %d succeeded, %d failed out of %d\n"
-            "Output: %s\n"
-            "Checkpoint: %s\n" + "="*60,
-            success, errors, total, output_file, checkpoint_file
+            "\n" + "=" * 60 + "\n"
+            "Scraping complete in %.1f seconds (%.1f problems/sec)\n"
+            "  Succeeded: %d\n"
+            "  Failed:    %d\n"
+            "  Total:     %d\n"
+            "  Output:    %s\n"
+            "  Checkpoint:%s\n" + "=" * 60,
+            elapsed, total / max(elapsed, 0.01),
+            self._done_count, self._error_count, total,
+            output_file, checkpoint_file,
         )
 
     # ------------------------------------------------------------------
-    # Convert JSONL output to a single JSON array file
+    # Convert JSONL → JSON array
     # ------------------------------------------------------------------
     @staticmethod
     def jsonl_to_json(jsonl_path: str, json_path: str):
-        """Convert JSONL output to a single pretty JSON array."""
         records = []
         with open(jsonl_path) as f:
             for line in f:
@@ -647,25 +759,29 @@ class CodeforcesScraper:
                      len(records), jsonl_path, json_path)
 
 
+# ======================================================================
+# CLI
+# ======================================================================
 def main():
     import argparse
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     )
 
     parser = argparse.ArgumentParser(
-        description="Scrape Codeforces problems into JSON.",
+        description="Scrape Codeforces problems into JSON (parallel).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --all                          Scrape everything (resumes automatically)
-  %(prog)s --all --max 10                 Scrape 10 problems (for testing)
+  %(prog)s --all                          Scrape everything (4 workers)
+  %(prog)s --all --workers 8              Scrape with 8 parallel workers
+  %(prog)s --all --max 20                 Scrape 20 problems (for testing)
   %(prog)s --all --min-rating 1200        Only problems rated ≥ 1200
-  %(prog)s --all --light                  Skip editorials & solutions (fast)
+  %(prog)s --all --light --workers 12     Fast mode, 12 workers
   %(prog)s CF-1560A CF-4B                 Scrape specific problems
-  %(prog)s --convert                      Convert JSONL output to JSON array
+  %(prog)s --convert                      Convert JSONL → JSON array
         """,
     )
     parser.add_argument(
@@ -677,13 +793,16 @@ Examples:
         help="Output file path (default: data/codeforces_problems.jsonl)",
     )
     parser.add_argument(
-        "--delay", type=float, default=REQUEST_DELAY,
-        help=f"Seconds between requests (default: {REQUEST_DELAY})",
+        "--workers", "-w", type=int, default=DEFAULT_WORKERS,
+        help=f"Number of parallel workers (default: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--rps", type=float, default=DEFAULT_RPS,
+        help=f"Max requests per second across all workers (default: {DEFAULT_RPS})",
     )
     parser.add_argument(
         "--cookies", type=str,
-        help="JSON file with Codeforces session cookies (for accessing "
-             "submission source code)",
+        help="JSON file with Codeforces session cookies",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -700,7 +819,7 @@ Examples:
     )
     parser.add_argument(
         "--light", action="store_true",
-        help="Skip editorial & solutions (much faster, statement + metadata only)",
+        help="Skip editorial & solutions (much faster)",
     )
     parser.add_argument(
         "--min-rating", type=int, default=None,
@@ -716,11 +835,9 @@ Examples:
     )
     args = parser.parse_args()
 
-    # Default output
     if not args.output:
         args.output = str(DEFAULT_OUTPUT)
 
-    # Convert mode
     if args.convert:
         jsonl_path = args.output
         json_path = jsonl_path.replace(".jsonl", ".json")
@@ -729,21 +846,20 @@ Examples:
         CodeforcesScraper.jsonl_to_json(jsonl_path, json_path)
         return
 
-    # Ensure data dir exists
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load cookies
     cookies = {}
     if args.cookies:
         with open(args.cookies) as f:
             cookies = json.load(f)
 
-    scraper = CodeforcesScraper(delay=args.delay, cookies=cookies)
+    scraper = CodeforcesScraper(rps=args.rps, cookies=cookies)
 
     if args.all:
         scraper.scrape_all(
             output_file=args.output,
             checkpoint_file=args.checkpoint,
+            workers=args.workers,
             max_problems=args.max,
             skip_editorial=args.light,
             skip_solutions=args.light,
