@@ -1,22 +1,13 @@
-"""
-CSES Problem Set Scraper
-
-Usage:
-    # Scrape all CSES problems:
-    python3 cses.py
-
-Output is written to data/cses_problems.jsonl
-"""
-
 import json
-import os
-import time
 import logging
+import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from bs4 import BeautifulSoup
+
 import cloudscraper
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +16,14 @@ DEFAULT_WORKERS = 4
 DEFAULT_RPS = 4.0
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-DEFAULT_OUTPUT = DATA_DIR / "cses_problems.jsonl"
+DEFAULT_OUTPUT = DATA_DIR / "cses_solutions.jsonl"
 DEFAULT_CHECKPOINT = DATA_DIR / "cses_checkpoint.txt"
+SOLUTIONS_DIR = DATA_DIR / "CSES-Solutions"
 
 
 class RateLimiter:
     """Thread-safe token-bucket rate limiter."""
+
     def __init__(self, rate: float):
         self.rate = rate
         self.capacity = max(rate, 1.0)
@@ -55,13 +48,22 @@ class CSESScraper:
     def __init__(self, rps: float = DEFAULT_RPS):
         # cloudscraper mimics a real browser to bypass potential Cloudflare protections
         self.session = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
         )
         self.limiter = RateLimiter(rps)
         self._file_lock = threading.Lock()
         self._progress_lock = threading.Lock()
         self._done_count = 0
         self._error_count = 0
+        
+        # Build mapping of problem title to local solution file path
+        self._solution_files = {}
+        if SOLUTIONS_DIR.exists():
+            for root, _, files in os.walk(SOLUTIONS_DIR):
+                for file in files:
+                    if file.endswith(".cpp"):
+                        title = file[:-4]  # Remove .cpp
+                        self._solution_files[title] = Path(root) / file
 
     def _get(self, url: str, retries: int = 3):
         self.limiter.acquire()
@@ -92,31 +94,37 @@ class CSESScraper:
         url = f"{BASE_URL}/problemset/list/"
         resp = self._get(url)
         soup = BeautifulSoup(resp.text, "html.parser")
-        
+
         problems = []
         # The problems are usually listed under <h2> category headers
         # Inside ul.task-list -> li.task -> a
-        
+
         for h2 in soup.find_all("h2"):
             category = h2.get_text(strip=True)
             ul = h2.find_next_sibling("ul", class_="task-list")
             if not ul:
                 continue
-                
+
             for a in ul.find_all("a", href=True):
                 href = a["href"]
                 if "/problemset/task/" in href:
                     task_id = href.strip("/").split("/")[-1]
                     title = a.get_text(strip=True)
-                    problems.append({
-                        "id": f"CSES-{task_id}",
-                        "task_id": task_id,
-                        "title": title,
-                        "category": category,
-                        "url": f"{BASE_URL}{href}"
-                    })
-                    
-        logger.info("Found %d problems across %d categories", len(problems), len(set(p['category'] for p in problems)))
+                    problems.append(
+                        {
+                            "id": f"CSES-{task_id}",
+                            "task_id": task_id,
+                            "title": title,
+                            "category": category,
+                            "url": f"{BASE_URL}{href}",
+                        }
+                    )
+
+        logger.info(
+            "Found %d problems across %d categories",
+            len(problems),
+            len(set(p["category"] for p in problems)),
+        )
         return problems
 
     def scrape_problem(self, problem_meta: dict) -> dict:
@@ -131,24 +139,35 @@ class CSESScraper:
 
         # Extract time and memory limits
         text = content_div.get_text("\n", strip=True)
-        
+
         # CSES puts limits at the top of the content div in unordered lists
         time_limit = ""
         memory_limit = ""
-        
+
         for li in content_div.find_all("li"):
             li_text = li.get_text(strip=True)
             if "Time limit:" in li_text:
                 time_limit = li_text.replace("Time limit:", "").strip()
             elif "Memory limit:" in li_text:
                 memory_limit = li_text.replace("Memory limit:", "").strip()
-        
+
         # Remove the limits from the statement text for cleaner output
         # Sometimes they are in an info box or list at the top
         ul_info = content_div.find("ul", class_="task-constraints")
         if ul_info:
             ul_info.decompose()  # Remove it from the tree before getting text again
             text = content_div.get_text("\n", strip=True)
+
+        # Check if we have a local solution file
+        accepted_solutions = []
+        if problem_meta["title"] in self._solution_files:
+            sol_path = self._solution_files[problem_meta["title"]]
+            try:
+                with open(sol_path, "r", encoding="utf-8") as f:
+                    code = f.read()
+                accepted_solutions.append(f"// Source: {sol_path.name}\n{code}")
+            except Exception as e:
+                logger.warning("Failed to read solution file for %s: %s", problem_meta["title"], e)
 
         return {
             "id": problem_meta["id"],
@@ -158,10 +177,13 @@ class CSESScraper:
             "category": problem_meta["category"],
             "problem_statement": text,
             "time_limit": time_limit,
-            "memory_limit": memory_limit
+            "memory_limit": memory_limit,
+            "accepted_solutions": accepted_solutions,
         }
 
-    def _scrape_one(self, problem_meta: dict, total: int, output_file: str, checkpoint_file: str) -> bool:
+    def _scrape_one(
+        self, problem_meta: dict, total: int, output_file: str, checkpoint_file: str
+    ) -> bool:
         pid = problem_meta["id"]
         try:
             data = self.scrape_problem(problem_meta)
@@ -188,11 +210,20 @@ class CSESScraper:
 
         if ok:
             stmt_len = len(data.get("problem_statement", ""))
-            logger.info("  ✓ [%d/%d] %s: %s (stmt=%d chars) errors=%d", 
-                        done + errs, total, pid, problem_meta["title"], stmt_len, errs)
+            logger.info(
+                "  ✓ [%d/%d] %s: %s (stmt=%d chars) errors=%d",
+                done + errs,
+                total,
+                pid,
+                problem_meta["title"],
+                stmt_len,
+                errs,
+            )
         return ok
 
-    def scrape_all(self, output_file: str, checkpoint_file: str, workers: int = DEFAULT_WORKERS):
+    def scrape_all(
+        self, output_file: str, checkpoint_file: str, workers: int = DEFAULT_WORKERS
+    ):
         problems = self.fetch_problem_list()
 
         seen = set()
@@ -203,23 +234,27 @@ class CSESScraper:
 
         filtered = [p for p in problems if p["id"] not in seen]
         total = len(filtered)
-        
+
         if not filtered:
             logger.info("Nothing to scrape – all done!")
             return
 
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-        
+
         logger.info("Starting scrape of %d problems using %d workers", total, workers)
-        
+
         t0 = time.monotonic()
-        
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cses-worker") as pool:
+
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="cses-worker"
+        ) as pool:
             futures = {
-                pool.submit(self._scrape_one, p, total, output_file, checkpoint_file): p["id"]
+                pool.submit(
+                    self._scrape_one, p, total, output_file, checkpoint_file
+                ): p["id"]
                 for p in filtered
             }
-            
+
             for fut in as_completed(futures):
                 pid = futures[fut]
                 try:
@@ -236,33 +271,49 @@ class CSESScraper:
             "  Total:     %d\n"
             "  Output:    %s\n"
             "  Checkpoint:%s\n" + "=" * 60,
-            elapsed, total / max(elapsed, 0.01),
-            self._done_count, self._error_count, total,
-            output_file, checkpoint_file,
+            elapsed,
+            total / max(elapsed, 0.01),
+            self._done_count,
+            self._error_count,
+            total,
+            output_file,
+            checkpoint_file,
         )
 
 
 def main():
     import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     )
 
     parser = argparse.ArgumentParser(description="Scrape CSES Problem Set into JSONL.")
-    parser.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT), help="Output JSONL file path")
-    parser.add_argument("--workers", "-w", type=int, default=DEFAULT_WORKERS, help="Number of parallel workers")
-    parser.add_argument("--rps", type=float, default=DEFAULT_RPS, help="Max requests per second")
-    parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT), help="Checkpoint file path")
+    parser.add_argument(
+        "-o", "--output", default=str(DEFAULT_OUTPUT), help="Output JSONL file path"
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Number of parallel workers",
+    )
+    parser.add_argument(
+        "--rps", type=float, default=DEFAULT_RPS, help="Max requests per second"
+    )
+    parser.add_argument(
+        "--checkpoint", default=str(DEFAULT_CHECKPOINT), help="Checkpoint file path"
+    )
     args = parser.parse_args()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     scraper = CSESScraper(rps=args.rps)
     scraper.scrape_all(
-        output_file=args.output,
-        checkpoint_file=args.checkpoint,
-        workers=args.workers
+        output_file=args.output, checkpoint_file=args.checkpoint, workers=args.workers
     )
+
 
 if __name__ == "__main__":
     main()

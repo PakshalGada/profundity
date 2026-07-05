@@ -23,6 +23,7 @@ Output is written to data/codeforces_problems.jsonl (one JSON object per line).
 
 import json
 import os
+import random
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -88,13 +89,22 @@ class RateLimiter:
 class CodeforcesScraper:
     def __init__(self, rps: float = DEFAULT_RPS,
                  cookies: Optional[dict] = None):
-        self.session = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
+        # Default browser for cloudscraper
+        browser_kwargs = {
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+        
+        # If cookies.json contains a User-Agent, use it explicitly instead of randomizing
+        custom_ua = None
+        if cookies and "User-Agent" in cookies:
+            custom_ua = cookies.pop("User-Agent")
+            
+        self.session = cloudscraper.create_scraper(browser=browser_kwargs)
+        if custom_ua:
+            self.session.headers.update({"User-Agent": custom_ua})
+
         if cookies:
             self.session.cookies.update(cookies)
 
@@ -129,6 +139,9 @@ class CodeforcesScraper:
             try:
                 logger.debug("GET %s (attempt %d)", url, attempt + 1)
                 resp = self.session.get(url, timeout=30)
+                if resp.status_code == 403:
+                    logger.warning("HTTP 403 on %s – skipping", url)
+                    resp.raise_for_status()
                 if resp.status_code == 429:
                     wait = RETRY_BACKOFF ** (attempt + 1)
                     logger.warning("Rate limited on %s, waiting %.1fs ...",
@@ -155,6 +168,9 @@ class CodeforcesScraper:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = self.session.get(url, params=params, timeout=60)
+                if resp.status_code == 403:
+                    logger.warning("HTTP 403 on %s – skipping", url)
+                    resp.raise_for_status()
                 if resp.status_code == 429:
                     wait = RETRY_BACKOFF ** (attempt + 1)
                     logger.warning("API rate limited, waiting %.1fs ...", wait)
@@ -319,6 +335,28 @@ class CodeforcesScraper:
             return ""
 
         soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Check for dynamic tutorial loading first
+        target_code = f"{contest_id}{index}"
+        tutorial_div = soup.find("div", class_="problemTutorial", problemcode=target_code)
+        if tutorial_div:
+            csrf_meta = soup.find("meta", {"name": "X-Csrf-Token"})
+            if csrf_meta:
+                csrf_token = csrf_meta.get("content")
+                try:
+                    self.limiter.acquire()
+                    tut_resp = self.session.post(
+                        f"{BASE_URL}/data/problemTutorial",
+                        data={"problemCode": target_code, "csrf_token": csrf_token},
+                        timeout=30
+                    )
+                    tut_data = tut_resp.json()
+                    if tut_data.get("success") == "true":
+                        tut_html = tut_data.get("html", "")
+                        tut_soup = BeautifulSoup(tut_html, "html.parser")
+                        return tut_soup.get_text("\n", strip=True)
+                except Exception as exc:
+                    logger.warning("Failed to fetch dynamic tutorial for %s: %s", target_code, exc)
 
         problem_patterns = [
             f"{contest_id}{index}",
